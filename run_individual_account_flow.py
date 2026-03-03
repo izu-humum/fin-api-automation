@@ -63,6 +63,8 @@ LAST_ACCESS_TOKEN: Optional[str] = None
 BENEFICIARY_IDS: list[str] = []
 # Map beneficiary_id -> currency (used to prefer non-USD for transfer-payout)
 BENEFICIARY_ID_TO_CURRENCY: dict[str, str] = {}
+# Liquidation addresses from beneficiary details (for summary / faucet USDC)
+LIQUIDATION_ADDRESSES: set[str] = set()
 
 def log_endpoint(name: str, method: str, path: str, response: requests.Response, body: Optional[Any] = None) -> None:
     """Log request and response for an endpoint."""
@@ -193,10 +195,10 @@ def main() -> int:
 
     # -------------------------------------------------------------------------
     # 2. Balances – Fetch Prefunded Balance
+    #    Skipped when using auto settlement: prefund balance is not required to run
+    #    transactions when settlement_config.auto_settlement is true.
     # -------------------------------------------------------------------------
-    log.info(">>> 2. Balances – Fetch Prefunded Balance")
-    r_bal = api_call("Fetch Prefunded Balance", "GET", "/v1/wallet/balances", session)
-    log_422_errors("Fetch Prefunded Balance", r_bal)
+    log.info(">>> 2. Balances – Fetch Prefunded Balance (skipped; not required for auto settlement)")
 
     # -------------------------------------------------------------------------
     # 3. Customers – Get Customer Details
@@ -366,6 +368,9 @@ def main() -> int:
                             BENEFICIARY_IDS.append(bid_str)
                         cur = ben.get("currency") or "USD"
                         BENEFICIARY_ID_TO_CURRENCY[bid_str] = cur
+                        liq = ben.get("liquidation_address")
+                        if liq:
+                            LIQUIDATION_ADDRESSES.add(liq)
             if BENEFICIARY_IDS:
                 log.info(
                     "Found %d existing beneficiary id(s) for customer; ids: %s",
@@ -865,6 +870,16 @@ def main() -> int:
                     beneficiary_id,
                     ben_currency,
                 )
+            # Remind user: transactions require USDC at the liquidation address.
+            liq_addr = (d_body.get("deposit_instruction") or {}).get("liquidation_address")
+            if liq_addr:
+                LIQUIDATION_ADDRESSES.add(liq_addr)
+                log.info(
+                    "Deposit USDC to your liquidation address to run transactions: %s",
+                    liq_addr,
+                )
+            else:
+                log.info("Deposit USDC to your liquidation address to run transactions.")
         except Exception:
             # If parsing fails we will fall back to existing mapping/defaults.
             pass
@@ -872,6 +887,7 @@ def main() -> int:
         # 19.3 – Create a Transfer (use beneficiary currency; sandbox rejects USD)
         transfer_currency = BENEFICIARY_ID_TO_CURRENCY.get(beneficiary_id, "GBP")
         log.info(">>> 19.3 Transactions – Create a Transfer (currency=%s)", transfer_currency)
+        # Create a Transfer: minimum amount 500 cents per API docs (developer.fin.com)
         transfer_body = {
             "beneficiary_id": beneficiary_id,
             "reference_id": "OFFRAMP-TEST-REF-1",
@@ -895,6 +911,17 @@ def main() -> int:
                 transfer_id = None
         else:
             log.warning("Create Transfer failed with status %s; skipping settle + transaction detail.", r_transfer.status_code)
+            try:
+                err_body = r_transfer.json()
+                err_msg = err_body.get("error") or err_body.get("message") or ""
+                if "auto settlement" in (err_msg or "").lower():
+                    log.warning(
+                        "API reports: %s – This is a backend rule (not in Create a Transfer spec). "
+                        "Use a beneficiary with auto_settlement disabled, or deposit USDC to liquidation address and retry per Fin guidance.",
+                        err_msg,
+                    )
+            except Exception:
+                pass
 
         # 19.4 – Settle a Transfer
         transaction_id: Optional[str] = None
@@ -1018,6 +1045,13 @@ def main() -> int:
         log.info("Beneficiary IDs involved in this run:")
         for bid in BENEFICIARY_IDS:
             log.info("- %s", bid)
+
+    # Liquidation address(es) – faucet USDC here to run transactions
+    if LIQUIDATION_ADDRESSES:
+        log.info("")
+        log.info("Liquidation address(es) – faucet USDC here to run transactions:")
+        for addr in sorted(LIQUIDATION_ADDRESSES):
+            log.info("  %s", addr)
 
     # Summary of any 4xx/5xx errors by API name
     errors = [r for r in API_RESULTS if 400 <= int(r.get("status", 0)) < 600]
