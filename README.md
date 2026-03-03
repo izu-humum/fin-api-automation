@@ -3,7 +3,18 @@
 This repo contains **curl scripts** for the [Fin.com Orchestration API](https://developer.fin.com), grouped by category under **`api-collection/`**. Each script calls one API endpoint.
 
 **Full documentation index:** https://developer.fin.com/llms.txt  
-**OpenAPI spec:** https://developer.fin.com/api-reference/spec/openapi.yaml
+**OpenAPI spec:** https://developer.fin.com/api-reference/spec/openapi.yaml  
+**Introduction & key concepts:** https://developer.fin.com/
+
+---
+
+## Key concepts (from Fin.com docs)
+
+- **Authentication**: OAuth 2.0 client credentials flow with token refresh. All API calls use a bearer token obtained from `POST /v1/oauth/token`.
+- **Customers**: Profiles that originate transactions (your end users/businesses). Each customer can have multiple beneficiaries.
+- **Beneficiaries**: Recipients of funds, always linked to a specific customer. The flows here create/list/update beneficiaries using `POST /v2/beneficiaries` and related endpoints.
+- **Catalogue**: Reference data such as supported countries, purposes, industries, occupations, and source of funds (all under `/v1/*` catalogue endpoints). The flows call these to drive valid inputs.
+- **Exchange Rates**: FX data and fee calculations via `GET /v1/fx-rate` and `POST /v1/fee-calculation` to understand rates and fees before creating transfers.
 
 ---
 
