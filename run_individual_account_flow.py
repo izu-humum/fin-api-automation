@@ -40,6 +40,10 @@ CUSTOMER_ID = os.environ.get("FIN_CUSTOMER_ID", "0c237aaa-4c6e-411f-aca6-785dacb
 CUSTOMER_NAME = os.environ.get("FIN_CUSTOMER_NAME", "Izu Humam")
 CUSTOMER_EMAIL = os.environ.get("FIN_CUSTOMER_EMAIL", "humam.izu@gmail.com")
 EXISTING_BENEFICIARY_ID = os.environ.get("FIN_BENEFICIARY_ID", "")
+# Wallet address to receive USDC (virtual account destination); we update virtual account to send here
+TARGET_WALLET_ADDRESS = os.environ.get("FIN_TARGET_WALLET_ADDRESS", "0xef7f82e4c116d52d57021ee774d193b540653e59").strip()
+# Your wallet address from API or after update; shown in summary for faucet
+MY_WALLET_ADDRESS: Optional[str] = None
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -190,7 +194,7 @@ def main() -> int:
     log.info("Token obtained successfully.")
     # Print the access token so it is visible in the terminal run
     log.info("Access token: %s", access_token)
-    global LAST_ACCESS_TOKEN
+    global LAST_ACCESS_TOKEN, MY_WALLET_ADDRESS
     LAST_ACCESS_TOKEN = access_token
 
     # -------------------------------------------------------------------------
@@ -224,6 +228,85 @@ def main() -> int:
                 "Could not determine customer_status from Get Customer Details response: %s",
                 exc,
             )
+
+    # -------------------------------------------------------------------------
+    # 3b. Virtual Accounts – List Virtual Accounts (your wallet for faucet)
+    # -------------------------------------------------------------------------
+    log.info(">>> 3b. Virtual Accounts – List Virtual Accounts")
+    r_va = api_call(
+        "List Virtual Accounts",
+        "GET",
+        "/v1/customers/virtual-account",
+        session,
+        params={"customer_id": CUSTOMER_ID},
+    )
+    first_va_id: Optional[str] = None
+    if r_va.status_code == 200:
+        try:
+            payload = r_va.json()
+            data = payload.get("data") or payload
+            accounts = data.get("virtual_accounts") or []
+            for va in accounts:
+                if isinstance(va, dict):
+                    if va.get("id") and not first_va_id:
+                        first_va_id = va["id"]
+                    dest = va.get("destination")
+                    if isinstance(dest, dict) and dest.get("address"):
+                        MY_WALLET_ADDRESS = dest["address"]
+                        break
+        except Exception as exc:
+            log.debug("Could not parse virtual account destination from response: %s", exc)
+
+    # -------------------------------------------------------------------------
+    # 3c. Virtual Accounts – Create (if none) or Update (send USDC to your wallet)
+    #     You faucet this wallet, then send to beneficiaries.
+    # -------------------------------------------------------------------------
+    if not first_va_id and TARGET_WALLET_ADDRESS:
+        log.info(">>> 3c. Virtual Accounts – Create Virtual Account (customer %s, destination: your wallet)", CUSTOMER_ID)
+        r_create_va = api_call(
+            "Create Virtual Account",
+            "POST",
+            "/v1/customers/virtual-account",
+            session,
+            json_body={
+                "customer_id": CUSTOMER_ID,
+                "destination_currency": "USDC",
+                "destination_chain": "POLYGON",
+                "source_rail": "ACH",
+                "source_currency": "USD",
+                "destination_wallet_address": TARGET_WALLET_ADDRESS,
+                "developer_fee_percentage": 1.5,
+            },
+        )
+        if r_create_va.status_code == 200:
+            try:
+                create_data = (r_create_va.json().get("data") or r_create_va.json())
+                if isinstance(create_data, dict) and create_data.get("id"):
+                    first_va_id = create_data["id"]
+                MY_WALLET_ADDRESS = TARGET_WALLET_ADDRESS
+                log.info("Virtual account created for customer %s; faucet this address then send to beneficiaries: %s", CUSTOMER_ID, TARGET_WALLET_ADDRESS)
+            except Exception as exc:
+                log.debug("Could not parse Create Virtual Account response: %s", exc)
+        else:
+            log.warning("Create Virtual Account returned %s.", r_create_va.status_code)
+    elif first_va_id and TARGET_WALLET_ADDRESS:
+        log.info(">>> 3c. Virtual Accounts – Update Virtual Account (destination: your wallet %s...)", TARGET_WALLET_ADDRESS[:18])
+        r_update_va = api_call(
+            "Update Virtual Account",
+            "PUT",
+            "/v1/customers/virtual-account",
+            session,
+            json_body={
+                "id": first_va_id,
+                "customer_id": CUSTOMER_ID,
+                "destination_wallet_address": TARGET_WALLET_ADDRESS,
+            },
+        )
+        if r_update_va.status_code == 200:
+            MY_WALLET_ADDRESS = TARGET_WALLET_ADDRESS
+            log.info("Virtual account updated; faucet this address then send to beneficiaries: %s", TARGET_WALLET_ADDRESS)
+        else:
+            log.warning("Update Virtual Account returned %s; summary may show previous destination.", r_update_va.status_code)
 
     # -------------------------------------------------------------------------
     # 4. Customers – List Customers (INDIVIDUAL)
@@ -849,12 +932,12 @@ def main() -> int:
     if beneficiary_id and customer_approved:
         log.info("Using beneficiary_id=%s for off-ramp transfer flow.", beneficiary_id)
 
-        # 19.2 – Fetch Beneficiary Details v2
-        log.info(">>> 19.2 Beneficiaries – Fetch Beneficiary Details v2")
+        # 19.2 – Fetch Beneficiary Details v1
+        log.info(">>> 19.2 Beneficiaries – Fetch Beneficiary Details v1")
         r_ben_details = api_call(
-            "Fetch Beneficiary Details v2 (Off-ramp Test)",
+            "Fetch Beneficiary Details v1 (Off-ramp Test)",
             "GET",
-            "/v2/beneficiaries/details",
+            "/v1/beneficiaries/details",
             session,
             params={"customer_id": CUSTOMER_ID, "beneficiary_id": beneficiary_id},
         )
@@ -1046,13 +1129,11 @@ def main() -> int:
         for bid in BENEFICIARY_IDS:
             log.info("- %s", bid)
 
-    # Liquidation address(es) – faucet USDC here to run transactions
-    if LIQUIDATION_ADDRESSES:
+    # Your wallet address (from virtual account) or beneficiary liquidation addresses
+    if MY_WALLET_ADDRESS:
         log.info("")
-        log.info("Liquidation address(es) – faucet USDC here to run transactions:")
-        for addr in sorted(LIQUIDATION_ADDRESSES):
-            log.info("  %s", addr)
-
+        log.info("Your wallet address – faucet USDC here to fund transfers to beneficiaries:")
+        log.info("  %s", MY_WALLET_ADDRESS)
     # Summary of any 4xx/5xx errors by API name
     errors = [r for r in API_RESULTS if 400 <= int(r.get("status", 0)) < 600]
     if errors:
