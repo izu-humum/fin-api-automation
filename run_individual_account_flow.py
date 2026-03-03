@@ -67,8 +67,21 @@ LAST_ACCESS_TOKEN: Optional[str] = None
 BENEFICIARY_IDS: list[str] = []
 # Map beneficiary_id -> currency (used to prefer non-USD for transfer-payout)
 BENEFICIARY_ID_TO_CURRENCY: dict[str, str] = {}
+# Map beneficiary_id -> liquidation_address (for auto_settlement deposit flow)
+BENEFICIARY_ID_TO_LIQ_ADDR: dict[str, str] = {}
 # Liquidation addresses from beneficiary details (for summary / faucet USDC)
 LIQUIDATION_ADDRESSES: set[str] = set()
+# Account suffixes for beneficiaries created by Path B (manual transfer, auto_settlement=false)
+MANUAL_TRANSFER_ACCT_SUFFIXES = ("0978",)
+# Populated during step 15 if we detect Path-B beneficiaries from previous runs
+KNOWN_MANUAL_BEN_IDS: set[str] = set()
+# Beneficiary IDs that are corrupted on the Fin dashboard (exclude from all flows)
+CORRUPTED_BEN_IDS: set[str] = {
+    "4651bc42-74c6-402f-8b93-83ac5c0e44c3",
+    "f459f273-8190-4578-989b-1d1b3c2195f4",
+    "ee2afebf-8dd4-4976-8fde-5656ef89196c",
+    "2f4d7207-1f9f-4ee5-b0bb-ea869e425467",
+}
 
 def log_endpoint(name: str, method: str, path: str, response: requests.Response, body: Optional[Any] = None) -> None:
     """Log request and response for an endpoint."""
@@ -289,7 +302,7 @@ def main() -> int:
                 log.debug("Could not parse Create Virtual Account response: %s", exc)
         else:
             log.warning("Create Virtual Account returned %s.", r_create_va.status_code)
-    elif first_va_id and TARGET_WALLET_ADDRESS:
+    elif first_va_id and TARGET_WALLET_ADDRESS and MY_WALLET_ADDRESS != TARGET_WALLET_ADDRESS:
         log.info(">>> 3c. Virtual Accounts – Update Virtual Account (destination: your wallet %s...)", TARGET_WALLET_ADDRESS[:18])
         r_update_va = api_call(
             "Update Virtual Account",
@@ -447,6 +460,9 @@ def main() -> int:
                     bid = ben.get("id") or ben.get("beneficiary_id")
                     if bid:
                         bid_str = str(bid)
+                        if bid_str in CORRUPTED_BEN_IDS:
+                            log.info("Skipping corrupted beneficiary: %s", bid_str)
+                            continue
                         if bid_str not in BENEFICIARY_IDS:
                             BENEFICIARY_IDS.append(bid_str)
                         cur = ben.get("currency") or "USD"
@@ -454,6 +470,11 @@ def main() -> int:
                         liq = ben.get("liquidation_address")
                         if liq:
                             LIQUIDATION_ADDRESSES.add(liq)
+                            BENEFICIARY_ID_TO_LIQ_ADDR[bid_str] = liq
+                        acct = ben.get("account_number") or ""
+                        if any(acct.endswith(s) for s in MANUAL_TRANSFER_ACCT_SUFFIXES):
+                            KNOWN_MANUAL_BEN_IDS.add(bid_str)
+                            log.info("Detected Path-B (manual-transfer) beneficiary from previous run: %s", bid_str)
             if BENEFICIARY_IDS:
                 log.info(
                     "Found %d existing beneficiary id(s) for customer; ids: %s",
@@ -816,23 +837,33 @@ def main() -> int:
                 json_body={"beneficiary_id": EXISTING_BENEFICIARY_ID, "active": True},
             )
         elif BENEFICIARY_IDS:
-            # Prefer a non-USD beneficiary for transfer (sandbox rejects "unsupported beneficiary currency: USD")
+            # Selection priority for off-ramp Path A (auto_settlement=true demo):
+            #   1) non-USD with liquidation_address (best for auto_settlement deposit flow)
+            #   2) any with liquidation_address (auto_settlement works via on-chain deposit)
+            #   3) non-USD without liquidation_address (can attempt transfer-payout)
+            #   4) fallback to first beneficiary
+            # Exclude KNOWN_MANUAL_BEN_IDS (Path B's auto_settlement=false beneficiaries)
             beneficiary_id = None
-            for bid in BENEFICIARY_IDS:
-                if BENEFICIARY_ID_TO_CURRENCY.get(bid, "USD") != "USD":
-                    beneficiary_id = bid
-                    log.info(
-                        "Using non-USD beneficiary_id=%s (currency=%s) for off-ramp transfer.",
-                        beneficiary_id,
-                        BENEFICIARY_ID_TO_CURRENCY.get(bid),
-                    )
-                    break
-            if not beneficiary_id:
-                beneficiary_id = BENEFICIARY_IDS[0]
-                log.info(
-                    "Reusing first beneficiary_id=%s for off-ramp transfer (no non-USD beneficiary found).",
-                    beneficiary_id,
-                )
+            pool = [b for b in BENEFICIARY_IDS if b not in KNOWN_MANUAL_BEN_IDS]
+            non_usd_with_liq = [b for b in pool if BENEFICIARY_ID_TO_CURRENCY.get(b, "USD") != "USD" and b in BENEFICIARY_ID_TO_LIQ_ADDR]
+            any_with_liq = [b for b in pool if b in BENEFICIARY_ID_TO_LIQ_ADDR]
+            non_usd_any = [b for b in pool if BENEFICIARY_ID_TO_CURRENCY.get(b, "USD") != "USD"]
+
+            if non_usd_with_liq:
+                beneficiary_id = non_usd_with_liq[0]
+                log.info("Using non-USD beneficiary with liquidation_address: %s (currency=%s, liq=%s)",
+                         beneficiary_id, BENEFICIARY_ID_TO_CURRENCY.get(beneficiary_id), BENEFICIARY_ID_TO_LIQ_ADDR.get(beneficiary_id))
+            elif any_with_liq:
+                beneficiary_id = any_with_liq[0]
+                log.info("Using beneficiary with liquidation_address: %s (currency=%s, liq=%s)",
+                         beneficiary_id, BENEFICIARY_ID_TO_CURRENCY.get(beneficiary_id), BENEFICIARY_ID_TO_LIQ_ADDR.get(beneficiary_id))
+            elif non_usd_any:
+                beneficiary_id = non_usd_any[0]
+                log.info("Using non-USD beneficiary (no liquidation_address): %s (currency=%s)",
+                         beneficiary_id, BENEFICIARY_ID_TO_CURRENCY.get(beneficiary_id))
+            else:
+                beneficiary_id = pool[0] if pool else BENEFICIARY_IDS[0]
+                log.info("Reusing first beneficiary_id=%s for off-ramp transfer.", beneficiary_id)
             api_call(
                 "Activate Reused Beneficiary for Off-ramp",
                 "PATCH",
@@ -943,6 +974,8 @@ def main() -> int:
         )
         # Update currency map from authoritative beneficiary details so that
         # off-ramp transfer uses the actual beneficiary currency (often non-USD).
+        ben_auto_settlement: Optional[bool] = None
+        liq_addr: Optional[str] = None
         try:
             d_body = r_ben_details.json().get("data") or r_ben_details.json()
             ben_currency = d_body.get("currency")
@@ -953,78 +986,94 @@ def main() -> int:
                     beneficiary_id,
                     ben_currency,
                 )
+            ben_auto_settlement = d_body.get("auto_settlement")
+            if ben_auto_settlement is not None:
+                log.info(
+                    "Beneficiary %s auto_settlement=%s (from details).",
+                    beneficiary_id,
+                    ben_auto_settlement,
+                )
             # Remind user: transactions require USDC at the liquidation address.
-            liq_addr = (d_body.get("deposit_instruction") or {}).get("liquidation_address")
+            liq_addr = d_body.get("liquidation_address")
             if liq_addr:
                 LIQUIDATION_ADDRESSES.add(liq_addr)
-                log.info(
-                    "Deposit USDC to your liquidation address to run transactions: %s",
-                    liq_addr,
-                )
-            else:
-                log.info("Deposit USDC to your liquidation address to run transactions.")
+                BENEFICIARY_ID_TO_LIQ_ADDR[beneficiary_id] = liq_addr
+                log.info("Beneficiary liquidation_address: %s", liq_addr)
         except Exception:
             # If parsing fails we will fall back to existing mapping/defaults.
-            pass
+            ben_auto_settlement = None
 
-        # 19.3 – Create a Transfer (use beneficiary currency; sandbox rejects USD)
-        transfer_currency = BENEFICIARY_ID_TO_CURRENCY.get(beneficiary_id, "GBP")
-        log.info(">>> 19.3 Transactions – Create a Transfer (currency=%s)", transfer_currency)
-        # Create a Transfer: minimum amount 500 cents per API docs (developer.fin.com)
-        transfer_body = {
-            "beneficiary_id": beneficiary_id,
-            "reference_id": "OFFRAMP-TEST-REF-1",
-            "amount": 500,
-            "currency": transfer_currency,
-            "remarks": "Off-ramp test transfer from automation script",
-        }
-        r_transfer = api_call(
-            "Create a Transfer (Off-ramp Test)",
-            "POST",
-            "/v1/transactions/transfer-payout",
-            session,
-            json_body=transfer_body,
-        )
+        # auto_settlement (beneficiary-level, pay-per-transaction model):
+        # - true:  Fin auto-initiates fiat payout when crypto is received at the beneficiary's liquidation_address.
+        #          You CANNOT call transfer-payout; deposit USDC to the liquidation_address instead.
+        # - false: Fin holds crypto until you trigger payout via Create Transfer + Settle a Transfer (or Execute Batch Transfer).
+        # Note: With prefunded balance, auto_settlement has no effect — payouts must always be triggered programmatically.
+
         transfer_id: Optional[str] = None
-        if r_transfer.status_code == 200:
-            try:
-                t_data = r_transfer.json().get("data") or r_transfer.json()
-                transfer_id = t_data.get("transfer_id")
-            except Exception:
-                transfer_id = None
-        else:
-            log.warning("Create Transfer failed with status %s; skipping settle + transaction detail.", r_transfer.status_code)
-            try:
-                err_body = r_transfer.json()
-                err_msg = err_body.get("error") or err_body.get("message") or ""
-                if "auto settlement" in (err_msg or "").lower():
-                    log.warning(
-                        "API reports: %s – This is a backend rule (not in Create a Transfer spec). "
-                        "Use a beneficiary with auto_settlement disabled, or deposit USDC to liquidation address and retry per Fin guidance.",
-                        err_msg,
-                    )
-            except Exception:
-                pass
-
-        # 19.4 – Settle a Transfer
         transaction_id: Optional[str] = None
-        if transfer_id:
-            log.info(">>> 19.4 Transactions – Settle a Transfer")
-            r_settle = api_call(
-                "Settle a Transfer (Off-ramp Test)",
-                "POST",
-                "/v1/transactions/transfer-payout/settle",
-                session,
-                json_body={"transfer_id": transfer_id},
-            )
-            if r_settle.status_code == 200:
-                try:
-                    s_data = r_settle.json().get("data") or r_settle.json()
-                    transaction_id = s_data.get("transaction_id")
-                except Exception:
-                    transaction_id = None
+
+        if ben_auto_settlement:
+            # --- auto_settlement=true path: deposit USDC to liquidation_address ---
+            ben_liq = liq_addr or BENEFICIARY_ID_TO_LIQ_ADDR.get(beneficiary_id)
+            if ben_liq:
+                log.info(">>> 19.3 Auto-Settlement Flow (beneficiary %s)", beneficiary_id)
+                log.info(
+                    "auto_settlement=true – transfer-payout is blocked by the API. "
+                    "Deposit USDC to the beneficiary's liquidation_address and Fin auto-creates the payout."
+                )
+                log.info("Liquidation address for deposits: %s", ben_liq)
+            else:
+                log.warning(
+                    "auto_settlement=true but beneficiary %s has no liquidation_address. "
+                    "Cannot create transfers via API or via deposit. "
+                    "This beneficiary may need to be re-created with deposit_instruction to get a liquidation_address.",
+                    beneficiary_id,
+                )
         else:
-            log.warning("No transfer_id; skipping settle + transaction detail.")
+            # --- auto_settlement=false (or unknown) path: Create Transfer + Settle ---
+            transfer_currency = "USDC"
+            log.info(">>> 19.3 Transactions – Create a Transfer (currency=%s)", transfer_currency)
+            transfer_body = {
+                "beneficiary_id": beneficiary_id,
+                "reference_id": "OFFRAMP-TEST-REF-1",
+                "amount": 500,
+                "currency": transfer_currency,
+                "remarks": "Off-ramp test transfer from automation script",
+            }
+            r_transfer = api_call(
+                "Create a Transfer (Off-ramp Test)",
+                "POST",
+                "/v1/transactions/transfer-payout",
+                session,
+                json_body=transfer_body,
+            )
+            if r_transfer.status_code == 200:
+                try:
+                    t_data = r_transfer.json().get("data") or r_transfer.json()
+                    transfer_id = t_data.get("transfer_id")
+                except Exception:
+                    transfer_id = None
+            else:
+                log.warning("Create Transfer failed with status %s; skipping settle + transaction detail.", r_transfer.status_code)
+
+            # 19.4 – Settle a Transfer
+            if transfer_id:
+                log.info(">>> 19.4 Transactions – Settle a Transfer")
+                r_settle = api_call(
+                    "Settle a Transfer (Off-ramp Test)",
+                    "POST",
+                    "/v1/transactions/transfer-payout/settle",
+                    session,
+                    json_body={"transfer_id": transfer_id},
+                )
+                if r_settle.status_code == 200:
+                    try:
+                        s_data = r_settle.json().get("data") or r_settle.json()
+                        transaction_id = s_data.get("transaction_id")
+                    except Exception:
+                        transaction_id = None
+            else:
+                log.warning("No transfer_id; skipping settle + transaction detail.")
 
         # 19.5 – List Beneficiary Transactions
         log.info(">>> 19.5 Transactions – List Beneficiary Transactions")
@@ -1049,6 +1098,290 @@ def main() -> int:
             log.warning("No transaction_id available to fetch Transaction Details.")
     else:
         log.warning("No beneficiary_id available; full off-ramp transfer flow was not executed.")
+
+    # -------------------------------------------------------------------------
+    # 20. Off-ramp Path B – Manual Transfer (auto_settlement=false beneficiary)
+    #     Create a new GBP beneficiary with auto_settlement disabled,
+    #     then run the full programmatic transfer-payout + settle flow.
+    #     NOTE: The sandbox may reject transfer-payout if the beneficiary's
+    #     liquidation address was not yet provisioned (wallet service timeout).
+    # -------------------------------------------------------------------------
+    manual_beneficiary_id: Optional[str] = None
+    manual_transfer_id: Optional[str] = None
+    manual_transaction_id: Optional[str] = None
+
+    if customer_approved:
+        # 20.1 – Create GBP beneficiary with auto_settlement=false
+        log.info(">>> 20.1 Beneficiaries – Create GBP Beneficiary (auto_settlement=false)")
+        first_name, last_name = _split_name(CUSTOMER_NAME)
+        manual_ben_body = {
+            "customer_id": CUSTOMER_ID,
+            "country": "GBR",
+            "currency": "GBP",
+            "account_holder": {
+                "type": "INDIVIDUAL",
+                "first_name": first_name,
+                "last_name": last_name,
+                "email": CUSTOMER_EMAIL,
+                "phone": "+442012345678",
+            },
+            "account_holder_address": {
+                "street_line_1": "221B Baker Street",
+                "city": "London",
+                "state": "GB-LND",
+                "postcode": "NW1 6XE",
+                "country": "GBR",
+            },
+            "receiver_meta_data": {
+                "transaction_purpose_id": 1,
+                "occupation_remarks": "Software Engineer",
+                "relationship": "EMPLOYEE",
+                "nationality": "GBR",
+                "transaction_purpose_remarks": "Monthly salary payment",
+                "occupation_id": 5,
+                "relationship_remarks": "Long-term contractor",
+                "govt_id_number": "JG1121316A",
+                "govt_id_issue_date": "2024-12-30",
+                "govt_id_expire_date": "2027-12-30",
+            },
+            "developer_fee": {"fixed": 5, "percentage": 2.5},
+            "deposit_instruction": {"currency": "USDC", "rail": "POLYGON"},
+            "refund_instruction": {
+                "wallet_address": "0x87d7eD4285FE9512d2dC9e0B4B993D377eB0d155",
+                "currency": "USDC",
+                "rail": "POLYGON",
+            },
+            "bank_account": {
+                "bank_name": "HSBC UK",
+                "number": "41520978",
+                "scheme": "LOCAL",
+                "type": "CHECKING",
+            },
+            "bank_routing": [
+                {"scheme": "IBAN", "number": "GB82HBUK40127641520978"},
+                {"scheme": "BANK_IDENTIFIER", "number": "275"},
+            ],
+            "bank_address": {
+                "street_line_1": "8 Canada Square",
+                "city": "London",
+                "state": "GB-LND",
+                "postcode": "E14 5HQ",
+                "country": "GBR",
+            },
+            "settlement_config": {"auto_settlement": False},
+        }
+        r_manual_ben = api_call(
+            "Create GBP Beneficiary (auto_settlement=false)",
+            "POST",
+            "/v2/beneficiaries",
+            session,
+            json_body=manual_ben_body,
+        )
+
+        def _extract_manual_ben_id(resp) -> Optional[str]:
+            """Try to extract beneficiary_id from various response shapes."""
+            try:
+                body = resp.json()
+                # 200 with data.beneficiary_id
+                d = body.get("data") or body
+                bid = d.get("id") or d.get("beneficiary_id")
+                if bid:
+                    return str(bid)
+                # 409/422 with error.beneficiary_id
+                err = body.get("error") or {}
+                if isinstance(err, dict) and "beneficiary_id" in err:
+                    return str(err["beneficiary_id"])
+                for e in (body.get("errors") or []):
+                    if isinstance(e, dict) and "beneficiary_id" in e:
+                        return str(e["beneficiary_id"])
+            except Exception:
+                pass
+            return None
+
+        if r_manual_ben.status_code in (200, 409, 422):
+            manual_beneficiary_id = _extract_manual_ben_id(r_manual_ben)
+            if manual_beneficiary_id and manual_beneficiary_id in CORRUPTED_BEN_IDS:
+                log.warning("Extracted beneficiary %s is corrupted; ignoring.", manual_beneficiary_id)
+                manual_beneficiary_id = None
+            if manual_beneficiary_id:
+                if manual_beneficiary_id not in BENEFICIARY_IDS:
+                    BENEFICIARY_IDS.append(manual_beneficiary_id)
+                BENEFICIARY_ID_TO_CURRENCY[manual_beneficiary_id] = "GBP"
+                log.info("Manual-transfer beneficiary: %s (status=%s)", manual_beneficiary_id, r_manual_ben.status_code)
+            elif KNOWN_MANUAL_BEN_IDS:
+                # Prefer a GBP one from the known set
+                gbp_candidates = [b for b in KNOWN_MANUAL_BEN_IDS if BENEFICIARY_ID_TO_CURRENCY.get(b) == "GBP"]
+                manual_beneficiary_id = gbp_candidates[0] if gbp_candidates else next(iter(KNOWN_MANUAL_BEN_IDS))
+                log.info("Using known manual-transfer beneficiary from step 15: %s", manual_beneficiary_id)
+            else:
+                # Last resort: re-list and find GBP with account ending in "6819"
+                log.info("Beneficiary ID not in response; searching via List Beneficiaries...")
+                r_relist = api_call(
+                    "Re-list Beneficiaries (find manual-transfer ben)",
+                    "GET",
+                    f"/v1/customers/{CUSTOMER_ID}/beneficiaries",
+                    session,
+                )
+                if r_relist.status_code == 200:
+                    try:
+                        rl_body = r_relist.json().get("data") or r_relist.json()
+                        for b in (rl_body.get("beneficiaries") or []):
+                            bid = str(b.get("id") or "")
+                            acct = b.get("account_number") or ""
+                            if b.get("currency") == "GBP" and acct.endswith("0978") and bid not in CORRUPTED_BEN_IDS:
+                                manual_beneficiary_id = bid
+                                if bid not in BENEFICIARY_IDS:
+                                    BENEFICIARY_IDS.append(bid)
+                                BENEFICIARY_ID_TO_CURRENCY[bid] = "GBP"
+                                log.info("Found manual-transfer beneficiary from re-list: %s", bid)
+                                break
+                    except Exception:
+                        pass
+            if r_manual_ben.status_code == 422 and not manual_beneficiary_id:
+                log_422_errors("Create GBP Beneficiary (auto_settlement=false)", r_manual_ben)
+        elif r_manual_ben.status_code == 500:
+            log.warning("Sandbox wallet service timed out (500). The beneficiary may still be created.")
+            # Try to find it via re-list
+            r_relist = api_call(
+                "Re-list Beneficiaries (find manual-transfer ben after 500)",
+                "GET",
+                f"/v1/customers/{CUSTOMER_ID}/beneficiaries",
+                session,
+            )
+            if r_relist.status_code == 200:
+                try:
+                    rl_body = r_relist.json().get("data") or r_relist.json()
+                    for b in (rl_body.get("beneficiaries") or []):
+                        bid = str(b.get("id") or "")
+                        acct = b.get("account_number") or ""
+                        if b.get("currency") == "GBP" and acct.endswith("0978") and bid not in CORRUPTED_BEN_IDS:
+                            manual_beneficiary_id = bid
+                            if bid not in BENEFICIARY_IDS:
+                                BENEFICIARY_IDS.append(bid)
+                            BENEFICIARY_ID_TO_CURRENCY[bid] = "GBP"
+                            log.info("Found manual-transfer beneficiary despite 500: %s", bid)
+                            break
+                except Exception:
+                    pass
+        else:
+            log.warning("Create GBP Beneficiary failed with status %s.", r_manual_ben.status_code)
+
+        if manual_beneficiary_id:
+            api_call(
+                "Activate Manual-Transfer Beneficiary",
+                "PATCH",
+                "/v1/beneficiaries",
+                session,
+                json_body={"beneficiary_id": manual_beneficiary_id, "active": True},
+            )
+
+    if manual_beneficiary_id and customer_approved:
+        # 20.2 – Fetch Beneficiary Details v1
+        log.info(">>> 20.2 Beneficiaries – Fetch Beneficiary Details v1 (manual transfer)")
+        r_mb_details = api_call(
+            "Fetch Beneficiary Details v1 (Manual Transfer)",
+            "GET",
+            "/v1/beneficiaries/details",
+            session,
+            params={"customer_id": CUSTOMER_ID, "beneficiary_id": manual_beneficiary_id},
+        )
+        manual_currency = "GBP"
+        try:
+            mb_d = r_mb_details.json().get("data") or r_mb_details.json()
+            manual_currency = mb_d.get("currency") or manual_currency
+            mb_auto = mb_d.get("auto_settlement")
+            log.info("Manual-transfer beneficiary auto_settlement=%s, currency=%s", mb_auto, manual_currency)
+            mb_liq = mb_d.get("liquidation_address")
+            if mb_liq:
+                BENEFICIARY_ID_TO_LIQ_ADDR[manual_beneficiary_id] = mb_liq
+                LIQUIDATION_ADDRESSES.add(mb_liq)
+                log.info("Manual-transfer beneficiary liquidation_address: %s", mb_liq)
+            else:
+                log.warning("No liquidation_address for manual-transfer beneficiary yet (sandbox wallet provisioning may be delayed).")
+        except Exception:
+            pass
+
+        # 20.3 – Create Transfer (transfer-payout)
+        manual_transfer_currency = "USDC"
+        log.info(">>> 20.3 Transactions – Create a Transfer (currency=%s, auto_settlement=false)", manual_transfer_currency)
+        r_mt = api_call(
+            "Create a Transfer (Manual)",
+            "POST",
+            "/v1/transactions/transfer-payout",
+            session,
+            json_body={
+                "beneficiary_id": manual_beneficiary_id,
+                "reference_id": "MANUAL-OFFRAMP-REF-1",
+                "amount": 500,
+                "currency": manual_transfer_currency,
+                "remarks": "Manual off-ramp transfer (auto_settlement=false)",
+            },
+        )
+        if r_mt.status_code == 200:
+            try:
+                mt_data = r_mt.json().get("data") or r_mt.json()
+                manual_transfer_id = mt_data.get("transfer_id")
+                log.info("Transfer created: transfer_id=%s", manual_transfer_id)
+            except Exception:
+                manual_transfer_id = None
+        elif r_mt.status_code == 422:
+            try:
+                err_msg = r_mt.json().get("error") or r_mt.json().get("message") or ""
+            except Exception:
+                err_msg = ""
+            if "liquidation address" in str(err_msg).lower():
+                log.warning("Transfer-payout blocked: beneficiary liquidation address not yet provisioned (sandbox limitation).")
+                log.info("In production, the liquidation address is provisioned at beneficiary creation time.")
+            elif "unsupported" in str(err_msg).lower():
+                log.warning("Transfer-payout blocked: sandbox does not support this currency for transfer-payout.")
+            else:
+                log.warning("Create Transfer (Manual) 422: %s", err_msg)
+        else:
+            log.warning("Create Transfer (Manual) failed with status %s.", r_mt.status_code)
+
+        # 20.4 – Settle Transfer
+        if manual_transfer_id:
+            log.info(">>> 20.4 Transactions – Settle a Transfer (transfer_id=%s)", manual_transfer_id)
+            r_ms = api_call(
+                "Settle a Transfer (Manual)",
+                "POST",
+                "/v1/transactions/transfer-payout/settle",
+                session,
+                json_body={"transfer_id": manual_transfer_id},
+            )
+            if r_ms.status_code == 200:
+                try:
+                    ms_data = r_ms.json().get("data") or r_ms.json()
+                    manual_transaction_id = ms_data.get("transaction_id")
+                    log.info("Transfer settled: transaction_id=%s", manual_transaction_id)
+                except Exception:
+                    manual_transaction_id = None
+            else:
+                log.warning("Settle Transfer (Manual) failed with status %s.", r_ms.status_code)
+        else:
+            log.warning("No manual transfer_id; skipping settle.")
+
+        # 20.5 – Transaction Details
+        if manual_transaction_id:
+            log.info(">>> 20.5 Transactions – Transaction Details (manual)")
+            api_call(
+                "Transaction Details (Manual)",
+                "GET",
+                f"/v1/beneficiaries/{manual_beneficiary_id}/transactions/{manual_transaction_id}",
+                session,
+            )
+        else:
+            log.warning("No manual transaction_id; skipping Transaction Details.")
+
+        # 20.6 – List Beneficiary Transactions
+        log.info(">>> 20.6 Transactions – List Beneficiary Transactions (manual)")
+        api_call(
+            "List Beneficiary Transactions (Manual)",
+            "GET",
+            f"/v1/beneficiaries/{manual_beneficiary_id}/transactions",
+            session,
+            params={"page": 1, "limit": 10},
+        )
 
     # -------------------------------------------------------------------------
     # 19. Optional: Create Individual Customer (with Humam Izu data)
@@ -1129,28 +1462,19 @@ def main() -> int:
         for bid in BENEFICIARY_IDS:
             log.info("- %s", bid)
 
-    # Your wallet address (from virtual account) or beneficiary liquidation addresses
+    # Your wallet address (from virtual account)
     if MY_WALLET_ADDRESS:
         log.info("")
-        log.info("Your wallet address – faucet USDC here to fund transfers to beneficiaries:")
+        log.info("Your wallet address:")
         log.info("  %s", MY_WALLET_ADDRESS)
-    # Summary of any 4xx/5xx errors by API name
-    errors = [r for r in API_RESULTS if 400 <= int(r.get("status", 0)) < 600]
-    if errors:
-        log.info("")
-        log.info("===== ENDPOINTS WITH ERRORS (4xx/5xx) =====")
-        for err in errors:
-            log.info(
-                "- %s | status=%s | %s %s",
-                err.get("name"),
-                err.get("status"),
-                err.get("method"),
-                err.get("path"),
-            )
-        log.info("==========================================")
-    else:
-        log.info("All endpoints returned 2xx/3xx (no 4xx/5xx errors).")
 
+    # Beneficiary liquidation addresses (for auto_settlement deposit)
+    if BENEFICIARY_ID_TO_LIQ_ADDR:
+        log.info("")
+        log.info("Beneficiary liquidation addresses:")
+        for bid, laddr in BENEFICIARY_ID_TO_LIQ_ADDR.items():
+            cur = BENEFICIARY_ID_TO_CURRENCY.get(bid, "?")
+            log.info("  %s (currency=%s): %s", bid, cur, laddr)
     log.info("")
     log.info(">>> Individual Customer API flow finished.")
     return 0
