@@ -56,6 +56,14 @@ log = logging.getLogger(__name__)
 # Collected per-endpoint results for end-of-run summary
 API_RESULTS: list[dict[str, Any]] = []
 
+# Last access token issued in this run (for summary logging)
+LAST_ACCESS_TOKEN: Optional[str] = None
+
+# Any beneficiary_ids created/used during this run (for summary logging)
+BENEFICIARY_IDS: list[str] = []
+# Map beneficiary_id -> currency (used to prefer non-USD for transfer-payout)
+BENEFICIARY_ID_TO_CURRENCY: dict[str, str] = {}
+
 def log_endpoint(name: str, method: str, path: str, response: requests.Response, body: Optional[Any] = None) -> None:
     """Log request and response for an endpoint."""
     log.info("=== Endpoint: %s ===", name)
@@ -178,6 +186,10 @@ def main() -> int:
         return 1
     session.headers["Authorization"] = f"Bearer {access_token}"
     log.info("Token obtained successfully.")
+    # Print the access token so it is visible in the terminal run
+    log.info("Access token: %s", access_token)
+    global LAST_ACCESS_TOKEN
+    LAST_ACCESS_TOKEN = access_token
 
     # -------------------------------------------------------------------------
     # 2. Balances – Fetch Prefunded Balance
@@ -334,98 +346,317 @@ def main() -> int:
     # 15. Beneficiaries – List Beneficiaries For Customer
     # -------------------------------------------------------------------------
     log.info(">>> 15. Beneficiaries – List Beneficiaries For Customer")
-    api_call(
+    r_list_ben = api_call(
         "List Beneficiaries For Customer",
         "GET",
         f"/v1/customers/{CUSTOMER_ID}/beneficiaries",
         session,
     )
+    # Pre-populate BENEFICIARY_IDS from existing beneficiaries (if any)
+    if r_list_ben.status_code == 200:
+        try:
+            body = r_list_ben.json().get("data") or r_list_ben.json()
+            existing_bens = body.get("beneficiaries") or []
+            for ben in existing_bens:
+                if isinstance(ben, dict):
+                    bid = ben.get("id") or ben.get("beneficiary_id")
+                    if bid:
+                        bid_str = str(bid)
+                        if bid_str not in BENEFICIARY_IDS:
+                            BENEFICIARY_IDS.append(bid_str)
+                        cur = ben.get("currency") or "USD"
+                        BENEFICIARY_ID_TO_CURRENCY[bid_str] = cur
+            if BENEFICIARY_IDS:
+                log.info(
+                    "Found %d existing beneficiary id(s) for customer; ids: %s",
+                    len(BENEFICIARY_IDS),
+                    ", ".join(BENEFICIARY_IDS),
+                )
+        except Exception:
+            # If parsing fails, just continue; dummy creation logic will still work.
+            pass
 
     # -------------------------------------------------------------------------
-    # 15a. Beneficiaries – Create dummy beneficiaries (for testing)
+    # 15a. Beneficiaries – Create dummy beneficiaries (for testing, USA/ACH)
     # -------------------------------------------------------------------------
     if customer_approved:
-        log.info(">>> 15a. Beneficiaries – Create dummy beneficiaries for customer")
-        base_first, base_last = _split_name(CUSTOMER_NAME)
-        dummy_account_numbers = ["123456780", "123456781"]
-        for idx, acc_no in enumerate(dummy_account_numbers, start=1):
-            # Use the actual first name (no suffix) to satisfy validation rules
-            dummy_body = {
+        # If we already have beneficiaries for this customer, avoid creating duplicates.
+        if BENEFICIARY_IDS:
+            log.info(
+                "Skipping creation of dummy beneficiaries because %d beneficiary id(s) already exist for customer.",
+                len(BENEFICIARY_IDS),
+            )
+        else:
+            log.info(">>> 15a. Beneficiaries – Create dummy beneficiaries for customer (USA/ACH)")
+            base_first, base_last = _split_name(CUSTOMER_NAME)
+            dummy_account_numbers = ["1234567890", "1234567891"]
+            for idx, acc_no in enumerate(dummy_account_numbers, start=1):
+                dummy_body = {
                 "customer_id": CUSTOMER_ID,
-                "country": "AUS",
-                "currency": "AUD",
+                "country": "USA",
+                "currency": "USD",
                 "account_holder": {
                     "type": "INDIVIDUAL",
                     "first_name": base_first,
                     "last_name": base_last,
                     "email": CUSTOMER_EMAIL,
-                    "phone": "+61412345678",
+                    "phone": "+12025551234",
                 },
                 "account_holder_address": {
-                    "street_line_1": "42 Wallaby Way",
-                    "city": "Queensland",
-                    "state": "AU-SA",
-                    "postcode": "2000",
-                    "country": "AUS",
+                    "street_line_1": "456 Main Street",
+                    "city": "Brooklyn",
+                    "state": "US-NY",
+                    "postcode": "11201",
+                    "country": "USA",
+                    "street_line_2": "Apt 5B",
                 },
                 "receiver_meta_data": {
                     "transaction_purpose_id": 1,
-                    "transaction_purpose_remarks": "Send to Family & Friends",
-                    "occupation_id": 504,
-                    "occupation_remarks": "Software engineer",
-                    "relationship": "FAMILY_MEMBER",
-                    "relationship_remarks": "Family",
-                    "nationality": "AUS",
+                    "occupation_remarks": "Software Engineer",
+                    "relationship": "EMPLOYEE",
+                    "nationality": "USA",
+                    "transaction_purpose_remarks": "Monthly salary payment",
+                    "occupation_id": 5,
+                    "relationship_remarks": "Long-term contractor",
+                    "govt_id_number": "JG1121316A",
+                    "govt_id_issue_date": "2024-12-30",
+                    "govt_id_expire_date": "2027-12-30",
                 },
-                "developer_fee": {"fixed": 1.25, "percentage": 0.45},
+                "developer_fee": {
+                    "fixed": 5,
+                    "percentage": 2.5,
+                },
                 "deposit_instruction": {
                     "currency": "USDC",
                     "rail": "POLYGON",
-                    "liquidation_address": "0xc0470baa27e383a570226298f598fac0612f1143",
                 },
                 "refund_instruction": {
-                    "wallet_address": "0x1b577931C1cC2765024bFbafad97bCe14FF2e87F",
+                    "wallet_address": "0x1b577931c1cc2765024bfbafad97bce14ff2e87f",
                     "currency": "USDC",
                     "rail": "POLYGON",
                 },
                 "bank_account": {
-                    "bank_name": "Commonwealth Bank of Australia",
+                    "bank_name": "Chase Bank",
                     "number": acc_no,
                     "scheme": "LOCAL",
                     "type": "CHECKING",
                 },
-                # For AUS + LOCAL, both BSB and BANK_IDENTIFIER are required
-            "bank_routing": [
-                {
-                    "scheme": "BSB",
-                    "number": "123456",
-                },
-                {
-                    # For AUS, bank_identifier must be digits and cannot start with 0 (^[1-9]\\d*$)
-                    "scheme": "BANK_IDENTIFIER",
-                    "number": "2157391",
-                },
-            ],
+                "bank_routing": [
+                    {
+                        "scheme": "ACH",
+                        "number": "021000021",
+                    },
+                    {
+                        "scheme": "BANK_IDENTIFIER",
+                        "number": "1",
+                    },
+                ],
                 "bank_address": {
-                    "street_line_1": "Ground Floor Tower 1, 201 Sussex Street",
-                    "city": "Sydney",
-                    "state": "AU-SA",
-                    "postcode": "2000",
-                    "country": "AUS",
+                    "street_line_1": "123 Bank Street",
+                    "city": "New York",
+                    "state": "US-NY",
+                    "postcode": "10001",
+                    "country": "USA",
+                    "street_line_2": "Suite 100",
                 },
-            }
-            r_dummy = api_call(
-                f"Create Dummy Beneficiary {idx}",
-                "POST",
-                "/v2/beneficiaries",
-                session,
-                json_body=dummy_body,
-            )
-            log_422_errors(f"Create Dummy Beneficiary {idx}", r_dummy)
+                    "settlement_config": {
+                        "auto_settlement": True,
+                    },
+                }
+                r_dummy = api_call(
+                    f"Create Dummy Beneficiary {idx}",
+                    "POST",
+                    "/v2/beneficiaries",
+                    session,
+                    json_body=dummy_body,
+                )
+                if r_dummy.status_code == 200:
+                    try:
+                        ben_payload = r_dummy.json().get("data") or r_dummy.json()
+                        ben_id = ben_payload.get("id") or ben_payload.get("beneficiary_id")
+                        if ben_id:
+                            ben_id_str = str(ben_id)
+                            BENEFICIARY_IDS.append(ben_id_str)
+                            BENEFICIARY_ID_TO_CURRENCY[ben_id_str] = "USD"
+                            log.info(
+                                "Captured dummy beneficiary %s id: %s",
+                                idx,
+                                ben_id_str,
+                            )
+                            # Ensure beneficiary is active per Update Beneficiary Active Status API
+                            api_call(
+                                f"Activate Dummy Beneficiary {idx}",
+                                "PATCH",
+                                "/v1/beneficiaries",
+                                session,
+                                json_body={"beneficiary_id": ben_id_str, "active": True},
+                            )
+                    except Exception:
+                        log.warning(
+                            "Could not parse beneficiary id from dummy beneficiary %s response.",
+                            idx,
+                        )
+                else:
+                    log_422_errors(f"Create Dummy Beneficiary {idx}", r_dummy)
     else:
         log.info(
             "Skipping creation of dummy beneficiaries because customer is not APPROVED."
         )
+
+    # -------------------------------------------------------------------------
+    # 15b. Beneficiaries – Create non-USD dummy beneficiaries (GBP, EUR) for transfer
+    #      Sandbox transfer-payout rejects "unsupported beneficiary currency: USD";
+    #      create GBP/EUR beneficiaries and use one for the transfer.
+    # -------------------------------------------------------------------------
+    if customer_approved:
+        # If there is already at least one non-USD beneficiary, avoid creating more
+        # to respect the \"no duplicate destination\" rule and reduce 409s.
+        existing_non_usd = [
+            (bid, cur)
+            for bid, cur in BENEFICIARY_ID_TO_CURRENCY.items()
+            if cur and cur.upper() != "USD"
+        ]
+        if existing_non_usd:
+            log.info(
+                "Skipping creation of non-USD beneficiaries because %d non-USD beneficiary(ies) already exist for customer.",
+                len(existing_non_usd),
+            )
+        else:
+            base_first, base_last = _split_name(CUSTOMER_NAME)
+            non_usd_beneficiaries = [
+                {
+                    "label": "GBR/GBP",
+                    "country": "GBR",
+                    "currency": "GBP",
+                    # Germany/GBR phone formats use fixed national lengths;
+                    # this number matches the +44 pattern and expected length.
+                    "phone": "+447700900123",
+                    "postcode": "SW1A 1AA",
+                    "state": "GB-LND",
+                    "bank_name": "Barclays",
+                    "account_number": "12345678",
+                    # Use allowed routing schemes for GBR: e.g. SWIFT + BANK_IDENTIFIER
+                    "bank_routing": [
+                        {"scheme": "SWIFT", "number": "BARCGB22"},
+                        {"scheme": "BANK_IDENTIFIER", "number": "123456"},
+                    ],
+                    "city": "London",
+                    "street_line_1": "10 Downing Street",
+                },
+                {
+                    "label": "DEU/EUR",
+                    "country": "DEU",
+                    "currency": "EUR",
+                    # Ensure digit count within DEU range (10–11 digits excluding '+').
+                    "phone": "+49301234567",
+                    "postcode": "10115",
+                    "state": "DE-BE",
+                    "bank_name": "Deutsche Bank",
+                    "account_number": "32013000",
+                    # DEU requires 'bank_identifier' routing; include both IBAN and BANK_IDENTIFIER.
+                    "bank_routing": [
+                        {"scheme": "IBAN", "number": "DE89370400440532013000"},
+                        {"scheme": "BANK_IDENTIFIER", "number": "10070000"},
+                    ],
+                    "city": "Berlin",
+                    "street_line_1": "Unter den Linden 1",
+                },
+            ]
+            for spec in non_usd_beneficiaries:
+                log.info(">>> 15b. Create non-USD beneficiary (%s)", spec["label"])
+            body_15b = {
+                "customer_id": CUSTOMER_ID,
+                "country": spec["country"],
+                "currency": spec["currency"],
+                "account_holder": {
+                    "type": "INDIVIDUAL",
+                    "first_name": base_first,
+                    "last_name": base_last,
+                    "email": CUSTOMER_EMAIL,
+                    "phone": spec["phone"],
+                },
+                "account_holder_address": {
+                    "street_line_1": spec["street_line_1"],
+                    "city": spec["city"],
+                    "postcode": spec["postcode"],
+                    "country": spec["country"],
+                },
+                "receiver_meta_data": {
+                    "transaction_purpose_id": 1,
+                    "occupation_remarks": "Software Engineer",
+                    "relationship": "EMPLOYEE",
+                    "nationality": spec["country"],
+                    "transaction_purpose_remarks": "Monthly salary payment",
+                    "occupation_id": 5,
+                    "relationship_remarks": "Long-term contractor",
+                    "govt_id_number": "JG1121316A",
+                    "govt_id_issue_date": "2024-12-30",
+                    "govt_id_expire_date": "2027-12-30",
+                },
+                "developer_fee": {"fixed": 5, "percentage": 2.5},
+                "deposit_instruction": {"currency": "USDC", "rail": "POLYGON"},
+                "refund_instruction": {
+                    "wallet_address": "0x1b577931c1cc2765024bfbafad97bce14ff2e87f",
+                    "currency": "USDC",
+                    "rail": "POLYGON",
+                },
+                "bank_account": {
+                    "bank_name": spec["bank_name"],
+                    "number": spec["account_number"],
+                    "scheme": "LOCAL",
+                    "type": "CHECKING",
+                },
+                "bank_routing": spec["bank_routing"],
+                "bank_address": {
+                    "street_line_1": spec["street_line_1"],
+                    "city": spec["city"],
+                    "postcode": spec["postcode"],
+                    "country": spec["country"],
+                },
+                "settlement_config": {"auto_settlement": True},
+            }
+            if spec.get("state"):
+                body_15b["account_holder_address"]["state"] = spec["state"]
+                body_15b["bank_address"]["state"] = spec["state"]
+            r_15b = api_call(
+                f"Create non-USD Beneficiary ({spec['label']})",
+                "POST",
+                "/v2/beneficiaries",
+                session,
+                json_body=body_15b,
+            )
+            if r_15b.status_code == 200:
+                try:
+                    ben_payload = r_15b.json().get("data") or r_15b.json()
+                    ben_id = ben_payload.get("id") or ben_payload.get("beneficiary_id")
+                    if ben_id:
+                        ben_id_str = str(ben_id)
+                        BENEFICIARY_IDS.append(ben_id_str)
+                        BENEFICIARY_ID_TO_CURRENCY[ben_id_str] = spec["currency"]
+                        log.info(
+                            "Created non-USD beneficiary %s id: %s",
+                            spec["label"],
+                            ben_id_str,
+                        )
+                        api_call(
+                            f"Activate non-USD Beneficiary ({spec['label']})",
+                            "PATCH",
+                            "/v1/beneficiaries",
+                            session,
+                            json_body={"beneficiary_id": ben_id_str, "active": True},
+                        )
+                except Exception:
+                    log.warning(
+                        "Could not parse beneficiary id from non-USD %s response.",
+                        spec["label"],
+                    )
+            elif r_15b.status_code == 409:
+                log.info(
+                    "Non-USD beneficiary %s already exists (409 Conflict); skipping.",
+                    spec["label"],
+                )
+            else:
+                log_422_errors(f"Create non-USD Beneficiary ({spec['label']})", r_15b)
 
     # -------------------------------------------------------------------------
     # 16. Customers – Enable USD Features
@@ -468,7 +699,7 @@ def main() -> int:
     )
 
     # -------------------------------------------------------------------------
-    # 19. Off-ramp flow – Create Beneficiary, Transfer, Settle, Inspect
+    # 19. Off-ramp flow – Reuse Beneficiary, Transfer, Settle, Inspect
     # -------------------------------------------------------------------------
     beneficiary_id: Optional[str] = None
 
@@ -477,76 +708,104 @@ def main() -> int:
             "Skipping off-ramp flow because customer is not in APPROVED status."
         )
     else:
+        # Priority for off-ramp:
+        # 1) FIN_BENEFICIARY_ID if provided
+        # 2) Any previously created beneficiary id from this run (e.g. dummy beneficiaries)
+        # 3) (fallback) create a new off-ramp beneficiary
         if EXISTING_BENEFICIARY_ID:
-            log.info("Using existing beneficiary id from FIN_BENEFICIARY_ID = %s", EXISTING_BENEFICIARY_ID)
+            log.info(
+                "Using existing beneficiary id from FIN_BENEFICIARY_ID = %s for off-ramp flow",
+                EXISTING_BENEFICIARY_ID,
+            )
             beneficiary_id = EXISTING_BENEFICIARY_ID
+            if EXISTING_BENEFICIARY_ID not in BENEFICIARY_IDS:
+                BENEFICIARY_IDS.append(EXISTING_BENEFICIARY_ID)
+            api_call(
+                "Activate Existing Beneficiary",
+                "PATCH",
+                "/v1/beneficiaries",
+                session,
+                json_body={"beneficiary_id": EXISTING_BENEFICIARY_ID, "active": True},
+            )
+        elif BENEFICIARY_IDS:
+            # Prefer a non-USD beneficiary for transfer (sandbox rejects "unsupported beneficiary currency: USD")
+            beneficiary_id = None
+            for bid in BENEFICIARY_IDS:
+                if BENEFICIARY_ID_TO_CURRENCY.get(bid, "USD") != "USD":
+                    beneficiary_id = bid
+                    log.info(
+                        "Using non-USD beneficiary_id=%s (currency=%s) for off-ramp transfer.",
+                        beneficiary_id,
+                        BENEFICIARY_ID_TO_CURRENCY.get(bid),
+                    )
+                    break
+            if not beneficiary_id:
+                beneficiary_id = BENEFICIARY_IDS[0]
+                log.info(
+                    "Reusing first beneficiary_id=%s for off-ramp transfer (no non-USD beneficiary found).",
+                    beneficiary_id,
+                )
+            api_call(
+                "Activate Reused Beneficiary for Off-ramp",
+                "PATCH",
+                "/v1/beneficiaries",
+                session,
+                json_body={"beneficiary_id": beneficiary_id, "active": True},
+            )
         else:
-            log.info(">>> 19.1 Beneficiaries – Create Beneficiary (off-ramp test)")
+            log.info(">>> 19.1 Beneficiaries – Create Beneficiary (off-ramp test, GBR/GBP)")
             first_name, last_name = _split_name(CUSTOMER_NAME)
             create_beneficiary_body = {
-            "customer_id": CUSTOMER_ID,
-            "country": "AUS",
-            "currency": "AUD",
-            "account_holder": {
-                "type": "INDIVIDUAL",
-                "first_name": first_name,
-                "last_name": last_name,
-                "email": CUSTOMER_EMAIL,
-                "phone": "+61412345678",
-            },
-            "account_holder_address": {
-                "street_line_1": "42 Wallaby Way",
-                "city": "Queensland",
-                "state": "AU-SA",
-                "postcode": "2000",
-                "country": "AUS",
-            },
-            "receiver_meta_data": {
-                "transaction_purpose_id": 1,
-                "transaction_purpose_remarks": "Send to Family & Friends",
-                "occupation_id": 504,
-                "occupation_remarks": "Software engineer",
-                "relationship": "FAMILY_MEMBER",
-                "relationship_remarks": "Family",
-                "nationality": "AUS",
-            },
-            "developer_fee": {"fixed": 1.25, "percentage": 0.45},
-            "deposit_instruction": {
-                "currency": "USDC",
-                "rail": "POLYGON",
-                "liquidation_address": "0xc0470baa27e383a570226298f598fac0612f1143",
-            },
-            "refund_instruction": {
-                "wallet_address": "0x1b577931C1cC2765024bFbafad97bCe14FF2e87F",
-                "currency": "USDC",
-                "rail": "POLYGON",
-            },
-            "bank_account": {
-                "bank_name": "Commonwealth Bank of Australia",
-                "number": "123456782",
-                "scheme": "LOCAL",
-                "type": "CHECKING",
-            },
-            # For AUS + LOCAL, both BSB and BANK_IDENTIFIER are required
-            "bank_routing": [
-                {
-                    "scheme": "BSB",
-                    "number": "123456",
+                "customer_id": CUSTOMER_ID,
+                "country": "GBR",
+                "currency": "GBP",
+                "account_holder": {
+                    "type": "INDIVIDUAL",
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "email": CUSTOMER_EMAIL,
+                    "phone": "+441234567890",
                 },
-                {
-                    # For AUS, bank_identifier must be digits and cannot start with 0 (^[1-9]\\d*$)
-                    "scheme": "BANK_IDENTIFIER",
-                    "number": "2157391",
+                "account_holder_address": {
+                    "street_line_1": "10 Downing Street",
+                    "city": "London",
+                    "postcode": "SW1A 1AA",
+                    "country": "GBR",
                 },
-            ],
-            "bank_address": {
-                "street_line_1": "Ground Floor Tower 1, 201 Sussex Street",
-                "city": "Sydney",
-                "state": "AU-SA",
-                "postcode": "2000",
-                "country": "AUS",
-            },
-        }
+                "receiver_meta_data": {
+                    "transaction_purpose_id": 1,
+                    "occupation_remarks": "Software Engineer",
+                    "relationship": "EMPLOYEE",
+                    "nationality": "GBR",
+                    "transaction_purpose_remarks": "Monthly salary payment",
+                    "occupation_id": 5,
+                    "relationship_remarks": "Long-term contractor",
+                    "govt_id_number": "JG1121316A",
+                    "govt_id_issue_date": "2024-12-30",
+                    "govt_id_expire_date": "2027-12-30",
+                },
+                "developer_fee": {"fixed": 5, "percentage": 2.5},
+                "deposit_instruction": {"currency": "USDC", "rail": "POLYGON"},
+                "refund_instruction": {
+                    "wallet_address": "0x1b577931c1cc2765024bfbafad97bce14ff2e87f",
+                    "currency": "USDC",
+                    "rail": "POLYGON",
+                },
+                "bank_account": {
+                    "bank_name": "Barclays",
+                    "number": "87654321",
+                    "scheme": "LOCAL",
+                    "type": "CHECKING",
+                },
+                "bank_routing": [{"scheme": "BRANCH_CODE", "number": "654321"}],
+                "bank_address": {
+                    "street_line_1": "10 Downing Street",
+                    "city": "London",
+                    "postcode": "SW1A 1AA",
+                    "country": "GBR",
+                },
+                "settlement_config": {"auto_settlement": True},
+            }
             r_ben = api_call(
                 "Create Beneficiary (Off-ramp Test)",
                 "POST",
@@ -558,31 +817,66 @@ def main() -> int:
                 try:
                     ben_data = r_ben.json().get("data") or r_ben.json()
                     beneficiary_id = ben_data.get("id") or ben_data.get("beneficiary_id")
+                    if beneficiary_id:
+                        beneficiary_id_str = str(beneficiary_id)
+                        BENEFICIARY_IDS.append(beneficiary_id_str)
+                        BENEFICIARY_ID_TO_CURRENCY[beneficiary_id_str] = "GBP"
+                        log.info("Captured off-ramp beneficiary id: %s", beneficiary_id_str)
+                        api_call(
+                            "Activate Off-ramp Beneficiary",
+                            "PATCH",
+                            "/v1/beneficiaries",
+                            session,
+                            json_body={
+                                "beneficiary_id": beneficiary_id_str,
+                                "active": True,
+                            },
+                        )
                 except Exception:
                     beneficiary_id = None
             else:
                 log_422_errors("Create Beneficiary (Off-ramp Test)", r_ben)
-                log.warning("Create Beneficiary failed with status %s; skipping transfer flow.", r_ben.status_code)
+                log.warning(
+                    "Create Beneficiary (Off-ramp Test) failed with status %s; skipping transfer flow.",
+                    r_ben.status_code,
+                )
 
     if beneficiary_id and customer_approved:
         log.info("Using beneficiary_id=%s for off-ramp transfer flow.", beneficiary_id)
 
         # 19.2 – Fetch Beneficiary Details v2
         log.info(">>> 19.2 Beneficiaries – Fetch Beneficiary Details v2")
-        api_call(
+        r_ben_details = api_call(
             "Fetch Beneficiary Details v2 (Off-ramp Test)",
             "GET",
             "/v2/beneficiaries/details",
             session,
             params={"customer_id": CUSTOMER_ID, "beneficiary_id": beneficiary_id},
         )
+        # Update currency map from authoritative beneficiary details so that
+        # off-ramp transfer uses the actual beneficiary currency (often non-USD).
+        try:
+            d_body = r_ben_details.json().get("data") or r_ben_details.json()
+            ben_currency = d_body.get("currency")
+            if ben_currency:
+                BENEFICIARY_ID_TO_CURRENCY[beneficiary_id] = ben_currency
+                log.info(
+                    "Beneficiary %s has currency=%s (from details).",
+                    beneficiary_id,
+                    ben_currency,
+                )
+        except Exception:
+            # If parsing fails we will fall back to existing mapping/defaults.
+            pass
 
-        # 19.3 – Create a Transfer
-        log.info(">>> 19.3 Transactions – Create a Transfer")
+        # 19.3 – Create a Transfer (use beneficiary currency; sandbox rejects USD)
+        transfer_currency = BENEFICIARY_ID_TO_CURRENCY.get(beneficiary_id, "GBP")
+        log.info(">>> 19.3 Transactions – Create a Transfer (currency=%s)", transfer_currency)
         transfer_body = {
             "beneficiary_id": beneficiary_id,
             "reference_id": "OFFRAMP-TEST-REF-1",
             "amount": 500,
+            "currency": transfer_currency,
             "remarks": "Off-ramp test transfer from automation script",
         }
         r_transfer = api_call(
@@ -696,6 +990,8 @@ def main() -> int:
     # -------------------------------------------------------------------------
     log.info("")
     log.info("===== INDIVIDUAL CUSTOMER API FLOW – SUMMARY =====")
+    if LAST_ACCESS_TOKEN:
+        log.info("Access token (full): %s", LAST_ACCESS_TOKEN)
     for idx, rinfo in enumerate(API_RESULTS, start=1):
         status = int(rinfo.get("status", 0))
         name = rinfo.get("name")
@@ -715,6 +1011,13 @@ def main() -> int:
             path,
         )
     log.info("==================================================")
+
+    # Beneficiary ids summary (if any)
+    if BENEFICIARY_IDS:
+        log.info("")
+        log.info("Beneficiary IDs involved in this run:")
+        for bid in BENEFICIARY_IDS:
+            log.info("- %s", bid)
 
     # Summary of any 4xx/5xx errors by API name
     errors = [r for r in API_RESULTS if 400 <= int(r.get("status", 0)) < 600]
