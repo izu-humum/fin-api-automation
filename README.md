@@ -46,16 +46,27 @@ Each `.sh` file has a comment with the official doc link. Replace placeholders (
 
 ---
 
-## Python automation (Individual Customer flow)
+## Python automation (Individual Account flow)
 
-To run the full API collection for an individual customer with logging:
+To run the full API collection for an individual account with logging:
 
 ```bash
 pip install -r requirements.txt
-./run_individual_customer_flow.py
+./run_individual_account_flow.py
 ```
 
-Optional: copy `.env.example` to `.env` and set `FIN_CLIENT_ID`, `FIN_CLIENT_SECRET`, `FIN_CUSTOMER_ID`, etc. The script uses defaults for the configured customer (Humam Izu, `humam.izu@gmail.com`, customer ID `c7620e2d-e2a0-47c7-86a9-40966599d456`). Logs are printed to the terminal at DEBUG level for each endpoint.
+Optional: copy `.env.example` to `.env` and set `FIN_CLIENT_ID`, `FIN_CLIENT_SECRET`, `FIN_CUSTOMER_ID`, etc. The script uses defaults for the configured customer (Izu Humam, `humam.izu@gmail.com`, customer ID `0c237aaa-4c6e-411f-aca6-785dacbe5545`). Logs are printed to the terminal at DEBUG level for each endpoint.
+
+## Python automation (Business Account flow)
+
+To run the full API collection for a business account (QA Alliance) with logging:
+
+```bash
+pip install -r requirements.txt
+./run_business_account_flow.py
+```
+
+Optional: copy `.env.example` to `.env` and set `FIN_CLIENT_ID`, `FIN_CLIENT_SECRET`, `FIN_CUSTOMER_ID`, etc. The script uses defaults for the configured business customer (QA Alliance, `humam.izu@gmail.com`, customer ID `fa4d375d-2cce-42df-9bd4-dc9dc2136818`). Logs are printed to the terminal at DEBUG level for each endpoint.
 
 ---
 
