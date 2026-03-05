@@ -18,7 +18,21 @@ This repo contains **curl scripts** for the [Fin.com Orchestration API](https://
 
 ---
 
-## Layout
+## Repository layout
+
+At a high level:
+
+- **Shell API collection**: `api-collection/`
+- **End‑to‑end Python flows**:
+  - `run_individual_account_flow.py` – individual customer, off‑ramp + manual transfer paths
+  - `run_business_account_flow.py` – business customer (QA Alliance) flow
+- **Environment & deps**:
+  - `.env.example` – sample environment configuration
+  - `requirements.txt` – Python dependencies
+
+---
+
+## API collection layout
 
 All curl scripts live under **`api-collection/`**, one file per endpoint:
 
