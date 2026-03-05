@@ -42,9 +42,10 @@ CUSTOMER_NAME = os.environ.get("FIN_CUSTOMER_NAME", "Izu Humam")
 CUSTOMER_EMAIL = os.environ.get("FIN_CUSTOMER_EMAIL", "humam.izu@gmail.com")
 EXISTING_BENEFICIARY_ID = os.environ.get("FIN_BENEFICIARY_ID", "")
 # Optional override for manual-transfer (Path B) beneficiary.
+# Default to empty so we only override when the env var is explicitly set.
 MANUAL_BENEFICIARY_OVERRIDE_ID = os.environ.get(
     "FIN_MANUAL_BENEFICIARY_ID",
-    "284b7f4a-869d-4d52-8b6e-e0933ddc0096",
+    "",
 )
 # Wallet address to receive USDC (virtual account destination); we update virtual account to send here
 TARGET_WALLET_ADDRESS = os.environ.get("FIN_TARGET_WALLET_ADDRESS", "0xef7f82e4c116d52d57021ee774d193b540653e59").strip()
@@ -1340,40 +1341,118 @@ def main() -> int:
             if manual_beneficiary_id not in BENEFICIARY_IDS:
                 BENEFICIARY_IDS.append(manual_beneficiary_id)
         else:
-            # Create non-USD beneficiary with auto_settlement=false
-            # Pick a validated country from BANK_IDS, use random data
-            chosen_cc_b = next(iter(BANK_IDS), None)
-            if not chosen_cc_b:
-                log.warning("No validated bank identifiers available; skipping Path B beneficiary creation.")
-            else:
-                chosen_bi_b = BANK_IDS[chosen_cc_b]
-                chosen_cinfo_b = chosen_bi_b.get("country_info") or {}
-                chosen_cur_b = chosen_cinfo_b.get("currency_code", "PHP")
+            # Prefer reusing existing AUS/USD business beneficiary matching the provided details.
+            log.info("Searching for existing AUS/USD business beneficiary matching provided details...")
+            r_list_aus = api_call(
+                "Find existing AUS/USD Business Beneficiary",
+                "GET",
+                f"/v1/customers/{CUSTOMER_ID}/beneficiaries",
+                session,
+                params={"page": 1, "limit": 50},
+            )
+            if r_list_aus.status_code == 200:
+                try:
+                    lb = r_list_aus.json().get("data") or r_list_aus.json()
+                    for b in (lb.get("beneficiaries") or []):
+                        if not isinstance(b, dict):
+                            continue
+                        if (
+                            str(b.get("country_code") or "").upper() == "AUS"
+                            and str(b.get("currency") or "").upper() == "USD"
+                            and (b.get("type") or "").upper() == "BUSINESS"
+                            and (b.get("business_name") or "") == "Sydney Technology PLC"
+                            and (b.get("email") or "") == "sydneytech@example.com"
+                        ):
+                            bid = str(b.get("id") or "")
+                            if bid and bid not in CORRUPTED_BEN_IDS:
+                                manual_beneficiary_id = bid
+                                if bid not in BENEFICIARY_IDS:
+                                    BENEFICIARY_IDS.append(bid)
+                                BENEFICIARY_ID_TO_CURRENCY[bid] = "USD"
+                                log.info("Reusing existing AUS/USD business beneficiary: %s", bid)
+                                break
+                except Exception:
+                    pass
+
+            chosen_cur_b = "USD"
+            if not manual_beneficiary_id:
+                # Create explicit AUS/USD business beneficiary with auto_settlement=false
                 log.info(
-                    ">>> 20.1 Beneficiaries – Create %s/%s Beneficiary (auto_settlement=false)",
-                    chosen_cc_b, chosen_cur_b,
+                    ">>> 20.1 Beneficiaries – Create AUS/USD Business Beneficiary (auto_settlement=false)",
                 )
-                log.info(
-                    "  Validated: country=%s, currency=%s, bank_id=%s (%s), branch_id=%s",
-                    chosen_cc_b, chosen_cur_b, chosen_bi_b["bank_id"],
-                    chosen_bi_b.get("bank_name", "?"), chosen_bi_b.get("branch_id") or "N/A",
-                )
-                manual_ben_body = _build_random_beneficiary(
-                    CUSTOMER_ID, chosen_cc_b, chosen_bi_b, auto_settlement=False,
-                )
-                holder_b = manual_ben_body["account_holder"]
-                log.info(
-                    "  Random data: name=%s %s, email=%s, phone=%s, acct=%s",
-                    holder_b["first_name"], holder_b["last_name"], holder_b["email"],
-                    holder_b["phone"], manual_ben_body["bank_account"]["number"],
-                )
+                manual_ben_body = {
+                    "customer_id": CUSTOMER_ID,
+                    "country": "AUS",
+                    "currency": "USD",
+                    "account_holder": {
+                        "type": "BUSINESS",
+                        "business_name": "Sydney Technology PLC",
+                        "email": "sydneytech@example.com",
+                        "phone": "+61412345678",
+                    },
+                    "bank_account": {
+                        "bank_name": "Commonwealth Bank of Australia",
+                        "number": "123466789",
+                        "scheme": "SWIFT",
+                        "type": "SAVINGS",
+                    },
+                    "bank_address": {
+                        "street_line_1": "Ground Floor Tower 1, 201 Sussex Street",
+                        "city": "Sydney",
+                        "state": "AU-SA",
+                        "postcode": "2000",
+                        "country": "AUS",
+                    },
+                    "account_holder_address": {
+                        "street_line_1": "42 Wallaby Way",
+                        "city": "Queensland",
+                        "state": "AU-SA",
+                        "postcode": "2000",
+                        "country": "AUS",
+                    },
+                    "receiver_meta_data": {
+                        "nationality": "AUS",
+                        "transaction_purpose_id": 8,
+                        "transaction_purpose_remarks": "Send to Family & Friends",
+                        "relationship": "FAMILY_MEMBER",
+                        "relationship_remarks": "Family & Friends",
+                    },
+                    "bank_routing": [
+                        {
+                            "scheme": "BANK_IDENTIFIER",
+                            "number": "3503",
+                        },
+                        {
+                            "scheme": "SWIFT",
+                            "number": "DBSSSGSG001",
+                        },
+                    ],
+                    "developer_fee": {
+                        "fixed": 0.55,
+                        "percentage": 0.15,
+                    },
+                    "deposit_instruction": {
+                        "currency": "USDC",
+                        "rail": "POLYGON",
+                    },
+                    "refund_instruction": {
+                        "wallet_address": "0x1b577931C1cC2765024bFbafad97bCe14FF2e87F",
+                        "currency": "USDC",
+                        "rail": "POLYGON",
+                    },
+                    "settlement_config": {
+                        "auto_settlement": False,
+                    },
+                }
                 r_manual_ben = api_call(
-                    f"Create {chosen_cur_b} Beneficiary (auto_settlement=false)",
+                    "Create AUS/USD Beneficiary (auto_settlement=false)",
                     "POST",
                     "/v2/beneficiaries",
                     session,
                     json_body=manual_ben_body,
                 )
+            else:
+                r_manual_ben = None
 
             def _extract_manual_ben_id(resp) -> Optional[str]:
                 try:
@@ -1392,7 +1471,7 @@ def main() -> int:
                     pass
                 return None
 
-            if r_manual_ben.status_code in (200, 409, 422):
+            if r_manual_ben and r_manual_ben.status_code in (200, 409, 422):
                 manual_beneficiary_id = _extract_manual_ben_id(r_manual_ben)
                 if manual_beneficiary_id and manual_beneficiary_id in CORRUPTED_BEN_IDS:
                     log.warning("Extracted beneficiary %s is corrupted; ignoring.", manual_beneficiary_id)
@@ -1402,61 +1481,14 @@ def main() -> int:
                         BENEFICIARY_IDS.append(manual_beneficiary_id)
                     BENEFICIARY_ID_TO_CURRENCY[manual_beneficiary_id] = chosen_cur_b
                     log.info("Manual-transfer beneficiary: %s (status=%s)", manual_beneficiary_id, r_manual_ben.status_code)
-                elif KNOWN_MANUAL_BEN_IDS:
-                    candidates = [b for b in KNOWN_MANUAL_BEN_IDS if BENEFICIARY_ID_TO_CURRENCY.get(b, "USD") != "USD"]
-                    manual_beneficiary_id = candidates[0] if candidates else next(iter(KNOWN_MANUAL_BEN_IDS))
-                    log.info("Using known manual-transfer beneficiary from step 15: %s", manual_beneficiary_id)
-                else:
-                    log.info("Beneficiary ID not in response; searching via List Beneficiaries...")
-                    r_relist = api_call(
-                        "Re-list Beneficiaries (find manual-transfer ben)",
-                        "GET",
-                        f"/v1/customers/{CUSTOMER_ID}/beneficiaries",
-                        session,
-                    )
-                    if r_relist.status_code == 200:
-                        try:
-                            rl_body = r_relist.json().get("data") or r_relist.json()
-                            for b in (rl_body.get("beneficiaries") or []):
-                                bid = str(b.get("id") or "")
-                                cur = (b.get("currency") or "").upper()
-                                if cur == chosen_cur_b and bid not in CORRUPTED_BEN_IDS:
-                                    manual_beneficiary_id = bid
-                                    if bid not in BENEFICIARY_IDS:
-                                        BENEFICIARY_IDS.append(bid)
-                                    BENEFICIARY_ID_TO_CURRENCY[bid] = chosen_cur_b
-                                    log.info("Found manual-transfer beneficiary from re-list: %s", bid)
-                                    break
-                        except Exception:
-                            pass
                 if r_manual_ben.status_code == 422 and not manual_beneficiary_id:
                     log_422_errors(f"Create {chosen_cur_b} Beneficiary (auto_settlement=false)", r_manual_ben)
-            elif r_manual_ben.status_code == 500:
-                log.warning("Sandbox wallet service timed out (500). The beneficiary may still be created.")
-                log.info("Request payload that triggered 500:\n%s", json.dumps(manual_ben_body, indent=2))
-                r_relist = api_call(
-                    "Re-list Beneficiaries (find manual-transfer ben after 500)",
-                    "GET",
-                    f"/v1/customers/{CUSTOMER_ID}/beneficiaries",
-                    session,
-                )
-                if r_relist.status_code == 200:
-                    try:
-                        rl_body = r_relist.json().get("data") or r_relist.json()
-                        for b in (rl_body.get("beneficiaries") or []):
-                            bid = str(b.get("id") or "")
-                            cur = (b.get("currency") or "").upper()
-                            if cur == chosen_cur_b and bid not in CORRUPTED_BEN_IDS:
-                                manual_beneficiary_id = bid
-                                if bid not in BENEFICIARY_IDS:
-                                    BENEFICIARY_IDS.append(bid)
-                                BENEFICIARY_ID_TO_CURRENCY[bid] = chosen_cur_b
-                                log.info("Found manual-transfer beneficiary despite 500: %s", bid)
-                                break
-                    except Exception:
-                        pass
-            else:
-                log.warning("Create %s Beneficiary failed with status %s.", chosen_cur_b, r_manual_ben.status_code)
+            elif r_manual_ben:
+                if r_manual_ben.status_code == 500:
+                    log.warning("Create AUS/USD Beneficiary returned 500; skipping manual-transfer flow for this run.")
+                    log.info("Request payload that triggered 500:\n%s", json.dumps(manual_ben_body, indent=2))
+                else:
+                    log.warning("Create AUS/USD Beneficiary failed with status %s.", r_manual_ben.status_code)
 
             if manual_beneficiary_id:
                 api_call(
