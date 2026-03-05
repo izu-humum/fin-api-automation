@@ -1493,31 +1493,6 @@ def main() -> int:
         except Exception:
             pass
 
-        # 20.2b – Capture existing manual transactions (baseline before transfer)
-        base_manual_tx_ids: set[str] = set()
-        try:
-            r_base_txs = api_call(
-                "List Beneficiary Transactions (Manual – baseline)",
-                "GET",
-                f"/v1/beneficiaries/{manual_beneficiary_id}/transactions",
-                session,
-                params={"page": 1, "limit": 10},
-            )
-            if r_base_txs.status_code == 200:
-                base_body = r_base_txs.json().get("data") or r_base_txs.json()
-                for tx in (base_body.get("transactions") or []):
-                    if isinstance(tx, dict):
-                        tid = str(tx.get("id") or tx.get("transaction_id") or "")
-                        if tid:
-                            base_manual_tx_ids.add(tid)
-                log.info(
-                    "Baseline manual transactions count for beneficiary %s: %d",
-                    manual_beneficiary_id,
-                    len(base_manual_tx_ids),
-                )
-        except Exception:
-            pass
-
         # 20.3 – Create Transfer (transfer-payout)
         manual_transfer_currency = "USDC"
         log.info(">>> 20.3 Transactions – Create a Transfer (currency=%s, auto_settlement=false)", manual_transfer_currency)
@@ -1575,62 +1550,6 @@ def main() -> int:
                     manual_transaction_id = None
             else:
                 log.warning("Settle Transfer (Manual) failed with status %s.", r_ms.status_code)
-
-            # 20.4b – Poll beneficiary transactions until a new transaction appears
-            if not manual_transaction_id:
-                log.info(
-                    "Polling beneficiary transactions to detect created manual transaction for beneficiary %s...",
-                    manual_beneficiary_id,
-                )
-                max_attempts = 6
-                poll_delay_sec = 5
-                for attempt in range(1, max_attempts + 1):
-                    log.info(
-                        "Poll attempt %d/%d – waiting %ds before request...",
-                        attempt,
-                        max_attempts,
-                        poll_delay_sec,
-                    )
-                    time.sleep(poll_delay_sec)
-                    r_poll = api_call(
-                        "List Beneficiary Transactions (Manual – poll)",
-                        "GET",
-                        f"/v1/beneficiaries/{manual_beneficiary_id}/transactions",
-                        session,
-                        params={"page": 1, "limit": 10},
-                    )
-                    if r_poll.status_code != 200:
-                        log.warning(
-                            "Poll %d: list beneficiary transactions returned status %s",
-                            attempt,
-                            r_poll.status_code,
-                        )
-                        continue
-                    try:
-                        poll_body = r_poll.json().get("data") or r_poll.json()
-                        txs = poll_body.get("transactions") or []
-                    except Exception:
-                        txs = []
-                    new_id: Optional[str] = None
-                    for tx in txs:
-                        if isinstance(tx, dict):
-                            tid = str(tx.get("id") or tx.get("transaction_id") or "")
-                            if tid and tid not in base_manual_tx_ids:
-                                new_id = tid
-                                break
-                    if new_id:
-                        manual_transaction_id = new_id
-                        log.info(
-                            "Detected new manual transaction_id=%s for beneficiary %s on attempt %d.",
-                            manual_transaction_id,
-                            manual_beneficiary_id,
-                            attempt,
-                        )
-                        break
-                if not manual_transaction_id:
-                    log.warning(
-                        "No new manual transaction appeared after polling; sandbox may not expose transaction_id yet."
-                    )
         else:
             log.warning("No manual transfer_id; skipping settle.")
 
